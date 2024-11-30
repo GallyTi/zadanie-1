@@ -3,7 +3,6 @@
 #include <stdint.h>
 #include <mpi.h>
 #include <string.h>
-#include <time.h>
 #include <limits.h>
 
 #define X_SIZE 1024
@@ -48,11 +47,10 @@ int main(int argc, char *argv[]) {
     size_t voxels_per_proc = TOTAL_VOXELS / world_size;
     size_t remainder = TOTAL_VOXELS % world_size;
 
-    // Change counts and displs to int arrays
     int *counts = malloc(world_size * sizeof(int));
     int *displs = malloc(world_size * sizeof(int));
 
-    // Assign counts and displacements, ensuring they fit into int
+    // Assign counts and displacements
     for (int i = 0; i < world_size; i++) {
         size_t count = voxels_per_proc;
         if (i == world_size - 1) {
@@ -75,51 +73,37 @@ int main(int argc, char *argv[]) {
         MPI_Abort(MPI_COMM_WORLD, 1);
     }
 
-    // Root process reads the entire data and scatters it
-    if (world_rank == 0) {
-        uint8_t *data = malloc(TOTAL_VOXELS * sizeof(uint8_t));
-        if (!data) {
-            fprintf(stderr, "Process %d: Failed to allocate data array\n", world_rank);
-            MPI_Abort(MPI_COMM_WORLD, 1);
-        }
+    // Read data in parallel using MPI I/O
+    MPI_File fh;
+    MPI_File_open(MPI_COMM_WORLD, "c8.raw", MPI_MODE_RDONLY, MPI_INFO_NULL, &fh);
 
-        // Read c8.raw
-        FILE *fp = fopen("c8.raw", "rb");
-        if (!fp) {
-            fprintf(stderr, "Process %d: Failed to open c8.raw\n", world_rank);
-            free(data);
-            MPI_Abort(MPI_COMM_WORLD, 1);
-        }
-        size_t items_read = fread(data, sizeof(uint8_t), TOTAL_VOXELS, fp);
-        fclose(fp);
-        if (items_read != TOTAL_VOXELS) {
-            fprintf(stderr, "Process %d: Failed to read data from c8.raw\n", world_rank);
-            free(data);
-            MPI_Abort(MPI_COMM_WORLD, 1);
-        }
-
-        // Scatter the data
-        MPI_Scatterv(data, counts, displs, MPI_UNSIGNED_CHAR, local_data, counts[world_rank], MPI_UNSIGNED_CHAR, 0, MPI_COMM_WORLD);
-
-        free(data);
-    } else {
-        // Other processes receive their portion
-        MPI_Scatterv(NULL, NULL, NULL, MPI_UNSIGNED_CHAR, local_data, counts[world_rank], MPI_UNSIGNED_CHAR, 0, MPI_COMM_WORLD);
-    }
+    MPI_Offset offset = (MPI_Offset)displs[world_rank];
+    MPI_Status status;
+    MPI_File_read_at(fh, offset, local_data, counts[world_rank], MPI_UNSIGNED_CHAR, &status);
+    MPI_File_close(&fh);
 
     // Start timing
+    MPI_Barrier(MPI_COMM_WORLD);
     double start_time = MPI_Wtime();
 
-    // Process local data
-    size_t max_codes = 1000000; // Initial size, adjust as needed
-    uint32_t *morton_codes = malloc(max_codes * sizeof(uint32_t));
+    // First pass: Count active voxels
+    size_t active_voxels = 0;
+    for (size_t i = 0; i < local_voxel_count; ++i) {
+        if (local_data[i] > THRESHOLD) {
+            ++active_voxels;
+        }
+    }
+
+    // Allocate morton_codes based on active_voxels
+    uint32_t *morton_codes = malloc(active_voxels * sizeof(uint32_t));
     if (!morton_codes) {
         fprintf(stderr, "Process %d: Failed to allocate morton_codes\n", world_rank);
         free(local_data);
         MPI_Abort(MPI_COMM_WORLD, 1);
     }
-    size_t code_count = 0;
 
+    // Second pass: Compute Morton codes
+    size_t code_count = 0;
     size_t start_idx = (size_t)displs[world_rank];
     for (size_t i = 0; i < local_voxel_count; ++i) {
         uint8_t value = local_data[i];
@@ -134,30 +118,12 @@ int main(int argc, char *argv[]) {
             uint32_t z = temp_idx / Y_SIZE;
 
             uint32_t morton_code = morton_encode(x, y, z);
-
-            if (code_count >= max_codes) {
-                // Need to reallocate morton_codes
-                size_t new_size = max_codes * 2;
-                uint32_t *new_array = realloc(morton_codes, new_size * sizeof(uint32_t));
-                if (!new_array) {
-                    fprintf(stderr, "Process %d: Failed to reallocate morton_codes\n", world_rank);
-                    free(morton_codes);
-                    free(local_data);
-                    MPI_Abort(MPI_COMM_WORLD, 1);
-                }
-                morton_codes = new_array;
-                max_codes = new_size;
-            }
             morton_codes[code_count++] = morton_code;
         }
     }
 
-    // Convert code_count to int for MPI
-    if (code_count > INT_MAX) {
-        fprintf(stderr, "Process %d: code_count exceeds INT_MAX\n", world_rank);
-        MPI_Abort(MPI_COMM_WORLD, 1);
-    }
-    int code_count_int = (int)code_count;
+    // Sort morton_codes locally
+    qsort(morton_codes, code_count, sizeof(uint32_t), compare_uint32);
 
     // Gather code counts
     int *recv_counts = NULL;
@@ -166,9 +132,10 @@ int main(int argc, char *argv[]) {
         recv_counts = malloc(world_size * sizeof(int));
         recv_displs = malloc(world_size * sizeof(int));
     }
+
+    int code_count_int = (int)code_count;
     MPI_Gather(&code_count_int, 1, MPI_INT, recv_counts, 1, MPI_INT, 0, MPI_COMM_WORLD);
 
-    // Gather morton_codes
     uint32_t *all_morton_codes = NULL;
     if (world_rank == 0) {
         int total_codes = 0;
@@ -182,32 +149,62 @@ int main(int argc, char *argv[]) {
         all_morton_codes = malloc(total_codes * sizeof(uint32_t));
     }
 
+    // Gather sorted morton_codes to root
     MPI_Gatherv(morton_codes, code_count_int, MPI_UINT32_T, all_morton_codes, recv_counts, recv_displs, MPI_UINT32_T, 0, MPI_COMM_WORLD);
 
-    // Root process sorts the combined array
+    // Root process merges the sorted arrays
     if (world_rank == 0) {
         int total_codes = 0;
         for (int i = 0; i < world_size; ++i) {
             total_codes += recv_counts[i];
         }
 
-        // Sort all_morton_codes[]
-        qsort(all_morton_codes, total_codes, sizeof(uint32_t), compare_uint32);
+        // Initialize positions and ends for k-way merge
+        int *positions = malloc(world_size * sizeof(int));
+        int *ends = malloc(world_size * sizeof(int));
+        for (int i = 0; i < world_size; ++i) {
+            positions[i] = recv_displs[i];
+            ends[i] = recv_displs[i] + recv_counts[i];
+        }
+
+        uint32_t *merged_codes = malloc(total_codes * sizeof(uint32_t));
+
+        // K-way merge
+        for (int k = 0; k < total_codes; ++k) {
+            uint32_t min_value = UINT32_MAX;
+            int min_index = -1;
+            for (int i = 0; i < world_size; ++i) {
+                if (positions[i] < ends[i]) {
+                    uint32_t value = all_morton_codes[positions[i]];
+                    if (value < min_value) {
+                        min_value = value;
+                        min_index = i;
+                    }
+                }
+            }
+            if (min_index == -1) {
+                fprintf(stderr, "Error during merging: no minimum found\n");
+                break;
+            }
+            merged_codes[k] = min_value;
+            positions[min_index]++;
+        }
 
         // End timing
         double end_time = MPI_Wtime();
+
         printf("Number of active voxels: %d\n", total_codes);
 
         // Output first 10 Morton codes
         printf("First 10 Morton codes:\n");
         for (int i = 0; i < 10 && i < total_codes; ++i) {
-            printf("%u\n", all_morton_codes[i]);
+            printf("%u\n", merged_codes[i]);
         }
 
-        // Verify if all_morton_codes[] is sorted
+        // Verify if merged_codes[] is sorted
         int is_sorted = 1;
         for (int i = 1; i < total_codes; ++i) {
-            if (all_morton_codes[i - 1] > all_morton_codes[i]) {
+            if (merged_codes[i - 1] > merged_codes[i]) {
                 is_sorted = 0;
                 fprintf(stderr, "Array is not sorted at index %d\n", i);
                 break;
@@ -223,7 +220,7 @@ int main(int argc, char *argv[]) {
         FILE *out_fp = fopen("morton_codes_mpi.txt", "w");
         if (out_fp) {
             for (int i = 0; i < total_codes; ++i) {
-                fprintf(out_fp, "%u\n", all_morton_codes[i]);
+                fprintf(out_fp, "%u\n", merged_codes[i]);
             }
             fclose(out_fp);
             printf("Morton codes saved to morton_codes_mpi.txt\n");
@@ -233,6 +230,9 @@ int main(int argc, char *argv[]) {
 
         printf("Processing time with %d processes: %f seconds\n", world_size, end_time - start_time);
 
+        free(merged_codes);
+        free(positions);
+        free(ends);
         free(all_morton_codes);
         free(recv_counts);
         free(recv_displs);
